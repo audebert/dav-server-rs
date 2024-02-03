@@ -70,36 +70,41 @@
 //!
 //! ```no_run
 //! use std::convert::Infallible;
+//! use std::error::Error;
+//! use tokio::net::TcpListener;
+//! use hyper_util::rt::TokioIo;
 //! use dav_server::{fakels::FakeLs, localfs::LocalFs, DavHandler};
+//! use http::Request;
+//! use hyper::{body::Incoming, service::service_fn};
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> Result<(), Box<dyn Error>> {
 //!     let dir = "/tmp";
-//!     let addr = ([127, 0, 0, 1], 4918).into();
+//!     let addr = "127.0.0.1:4918";
+//!     let listener = TcpListener::bind(&addr).await?;
 //!
 //!     let dav_server = DavHandler::builder()
 //!         .filesystem(LocalFs::new(dir, false, false, false))
 //!         .locksystem(FakeLs::new())
 //!         .build_handler();
 //!
-//!     let make_service = hyper::service::make_service_fn(move |_| {
-//!         let dav_server = dav_server.clone();
-//!         async move {
-//!             let func = move |req| {
-//!                 let dav_server = dav_server.clone();
-//!                 async move {
-//!                     Ok::<_, Infallible>(dav_server.handle(req).await)
-//!                 }
-//!             };
-//!             Ok::<_, Infallible>(hyper::service::service_fn(func))
-//!         }
-//!     });
-//!
 //!     println!("Serving {} on {}", dir, addr);
-//!     let _ = hyper::Server::bind(&addr)
-//!         .serve(make_service)
-//!         .await
-//!         .map_err(|e| eprintln!("server error: {}", e));
+//!     loop {
+//!         let (stream, _) = listener.accept().await?;
+//!         let io = TokioIo::new(stream);
+//!         let service = service_fn(|req: Request<Incoming>| {
+//!             let dav_server = dav_server.clone();
+//!             async move {
+//!                 Ok::<_, Infallible>(dav_server.handle(req).await)
+//!             }
+//!         });
+//!         if let Err(err) = hyper::server::conn::http1::Builder::new()
+//!             .serve_connection(io, service)
+//!             .await
+//!         {
+//!             println!("Error serving connection: {:?}", err);
+//!         }
+//!     }
 //! }
 //! ```
 //! [DavHandler]: struct.DavHandler.html

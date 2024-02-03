@@ -7,14 +7,15 @@
 
 use std::convert::Infallible;
 use std::error::Error;
-use std::net::SocketAddr;
-use std::str::FromStr;
 
 use clap::Parser;
-use futures_util::future::TryFutureExt;
 use headers::{authorization::Basic, Authorization, HeaderMapExt};
 
 use dav_server::{body::Body, fakels, localfs, memfs, memls, DavConfig, DavHandler};
+use http::Request;
+use hyper::{body::Incoming, service::service_fn};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
 
 #[derive(Clone)]
 struct Server {
@@ -45,7 +46,7 @@ impl Server {
 
     async fn handle(
         &self,
-        req: hyper::Request<hyper::Body>,
+        req: hyper::Request<hyper::body::Incoming>,
     ) -> Result<hyper::Response<Body>, Infallible> {
         let user = if self.auth {
             // we want the client to authenticate.
@@ -103,7 +104,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let args = Cli::parse();
 
-    let (dir, name) = match args.dir.as_ref() {
+    let (dir, _name) = match args.dir.as_ref() {
         Some(dir) => (dir.as_str(), dir.as_str()),
         None => ("", "memory filesystem"),
     };
@@ -112,26 +113,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let fakels = args.fakels;
 
     let dav_server = Server::new(dir.to_string(), memls, fakels, auth);
-    let make_service = hyper::service::make_service_fn(|_| {
-        let dav_server = dav_server.clone();
-        async move {
-            let func = move |req| {
-                let dav_server = dav_server.clone();
-                async move { dav_server.clone().handle(req).await }
-            };
-            Ok::<_, hyper::Error>(hyper::service::service_fn(func))
-        }
-    });
 
     let port = args.port;
     let addr = format!("0.0.0.0:{}", port);
-    let addr = SocketAddr::from_str(&addr)?;
+    let listener = TcpListener::bind(&addr).await?;
 
-    let server = hyper::Server::try_bind(&addr)?
-        .serve(make_service)
-        .map_err(|e| eprintln!("server error: {}", e));
-
-    println!("Serving {} on {}", name, port);
-    let _ = server.await;
-    Ok(())
+    println!("Serving {} on {}", dir, addr);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let service = service_fn(|req: Request<Incoming>| dav_server.handle(req));
+        if let Err(err) = hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await
+        {
+            println!("Error serving connection: {:?}", err);
+        }
+    }
 }

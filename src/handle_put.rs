@@ -1,12 +1,14 @@
 use std::any::Any;
 use std::error::Error as StdError;
 use std::io;
+use std::panic;
 
 use bytes::{Buf, Bytes};
 use headers::HeaderMapExt;
 use http::StatusCode as SC;
 use http::{self, Request, Response};
 use http_body::Body as HttpBody;
+use http_body_util::BodyExt;
 
 use crate::body::Body;
 use crate::conditional::if_match_get_tokens;
@@ -230,8 +232,11 @@ impl crate::DavInner {
         // loop, read body, write to file.
         let mut total = 0u64;
 
-        while let Some(data) = body.data().await {
-            let mut buf = data.map_err(|e| to_ioerror(e))?;
+        while let Some(data) = body.frame().await {
+            let frame = data.map_err(|e| to_ioerror(e))?;
+            let mut buf = frame
+                .into_data()
+                .unwrap_or_else(|_| panic!("Unexpected non-DATA frame"));
             let buflen = buf.remaining();
             total += buflen as u64;
             // consistency check.

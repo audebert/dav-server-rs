@@ -6,13 +6,13 @@ use std::error::Error as StdError;
 use std::io;
 use std::sync::Arc;
 
+use axum::body::Body;
 use bytes::{self, buf::Buf};
-use futures_util::stream::Stream;
 use headers::HeaderMapExt;
 use http::{Request, Response, StatusCode};
 use http_body::Body as HttpBody;
+use http_body_util::BodyExt;
 
-use crate::body::{Body, StreamBody};
 use crate::davheaders;
 use crate::davpath::DavPath;
 use crate::util::{dav_method, DavMethod, DavMethodSet};
@@ -178,7 +178,7 @@ pub(crate) struct DavInner {
 impl From<DavConfig> for DavInner {
     fn from(cfg: DavConfig) -> Self {
         DavInner {
-            prefix: cfg.prefix.unwrap_or_else(|| "".to_string()),
+            prefix: cfg.prefix.unwrap_or_default(),
             fs: cfg.fs.unwrap_or_else(|| VoidFs::new()),
             ls: cfg.ls,
             allow: cfg.allow,
@@ -199,7 +199,7 @@ impl From<&DavConfig> for DavInner {
                 .prefix
                 .as_ref()
                 .map(|p| p.to_owned())
-                .unwrap_or_else(|| "".to_string()),
+                .unwrap_or_default(),
             fs: cfg.fs.clone().unwrap(),
             ls: cfg.ls.clone(),
             allow: cfg.allow,
@@ -279,47 +279,6 @@ impl DavHandler {
         let inner = DavInner::from(self.config.merge(config));
         inner.handle(req).await
     }
-
-    /// Handles a request with a `Stream` body instead of a `HttpBody`.
-    /// Used with webserver frameworks that have not
-    /// opted to use the `http_body` crate just yet.
-    #[doc(hidden)]
-    pub async fn handle_stream<ReqBody, ReqData, ReqError>(
-        &self,
-        req: Request<ReqBody>,
-    ) -> Response<Body>
-    where
-        ReqData: Buf + Send + 'static,
-        ReqError: StdError + Send + Sync + 'static,
-        ReqBody: Stream<Item = Result<ReqData, ReqError>>,
-    {
-        let req = {
-            let (parts, body) = req.into_parts();
-            Request::from_parts(parts, StreamBody::new(body))
-        };
-        let inner = DavInner::from(&*self.config);
-        inner.handle(req).await
-    }
-
-    /// Handles a request with a `Stream` body instead of a `HttpBody`.
-    #[doc(hidden)]
-    pub async fn handle_stream_with<ReqBody, ReqData, ReqError>(
-        &self,
-        config: DavConfig,
-        req: Request<ReqBody>,
-    ) -> Response<Body>
-    where
-        ReqData: Buf + Send + 'static,
-        ReqError: StdError + Send + Sync + 'static,
-        ReqBody: Stream<Item = Result<ReqData, ReqError>>,
-    {
-        let req = {
-            let (parts, body) = req.into_parts();
-            Request::from_parts(parts, StreamBody::new(body))
-        };
-        let inner = DavInner::from(self.config.merge(config));
-        inner.handle(req).await
-    }
 }
 
 impl Default for DavHandler {
@@ -366,33 +325,20 @@ impl DavInner {
     pub(crate) async fn read_request<ReqBody, ReqData, ReqError>(
         &self,
         body: ReqBody,
-        max_size: usize,
     ) -> DavResult<Vec<u8>>
     where
         ReqBody: HttpBody<Data = ReqData, Error = ReqError>,
         ReqData: Buf + Send + 'static,
         ReqError: StdError + Send + Sync + 'static,
     {
-        let mut data = Vec::new();
-        pin_utils::pin_mut!(body);
-        while let Some(res) = body.data().await {
-            let mut buf = res.map_err(|_| {
-                DavError::IoError(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "UnexpectedEof",
-                ))
-            })?;
-            while buf.has_remaining() {
-                if data.len() + buf.remaining() > max_size {
-                    return Err(StatusCode::PAYLOAD_TOO_LARGE.into());
-                }
-                let b = buf.chunk();
-                let l = b.len();
-                data.extend_from_slice(b);
-                buf.advance(l);
-            }
-        }
-        Ok(data)
+        let Ok(collected) = body.collect().await else {
+            return Err(DavError::IoError(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "UnexpectedEof",
+            )));
+        };
+        let data = collected.to_bytes().to_vec();
+        Ok(data.to_vec())
     }
 
     // internal dispatcher.
@@ -515,7 +461,7 @@ impl DavInner {
         // other handlers either expected no body, or a pre-read Vec<u8>.
         let (body_strm, body_data) = match method {
             DavMethod::Put | DavMethod::Patch => (Some(body), Vec::new()),
-            _ => (None, self.read_request(body, 65536).await?),
+            _ => (None, self.read_request(body).await?),
         };
 
         // Not all methods accept a body.
@@ -534,7 +480,7 @@ impl DavInner {
 
         debug!("== START REQUEST {:?} {}", method, path);
 
-        let res = match method {
+        match method {
             DavMethod::Options => self.handle_options(&req).await,
             DavMethod::PropFind => self.handle_propfind(&req, &body_data).await,
             DavMethod::PropPatch => self.handle_proppatch(&req, &body_data).await,
@@ -545,7 +491,6 @@ impl DavInner {
             DavMethod::Head | DavMethod::Get => self.handle_get(&req).await,
             DavMethod::Copy | DavMethod::Move => self.handle_copymove(&req, method).await,
             DavMethod::Put | DavMethod::Patch => self.handle_put(&req, body_strm.unwrap()).await,
-        };
-        res
+        }
     }
 }

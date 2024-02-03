@@ -1,9 +1,13 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::io::{self, Cursor};
+use std::io::Cursor;
 
-use futures_util::{future::BoxFuture, FutureExt, StreamExt};
+use async_stream::try_stream;
+use bytes::Bytes;
+use futures_util::stream::BoxStream;
+use futures_util::Stream;
+use futures_util::StreamExt;
 use headers::HeaderMapExt;
 use http::{Request, Response, StatusCode};
 
@@ -14,7 +18,6 @@ use xml::writer::XmlEvent as XmlWEvent;
 use xml::EmitterConfig;
 use xmltree::{Element, XMLNode};
 
-use crate::async_stream::AsyncStream;
 use crate::body::Body;
 use crate::conditional::if_match_get_tokens;
 use crate::davheaders;
@@ -88,7 +91,6 @@ lazy_static! {
 }
 
 type Emitter = EventWriter<MemBuffer>;
-type Sender = crate::async_stream::Sender<bytes::Bytes, io::Error>;
 
 struct StatusElement {
     status: StatusCode,
@@ -97,7 +99,6 @@ struct StatusElement {
 
 struct PropWriter {
     emitter: Emitter,
-    tx: Option<Sender>,
     name: String,
     props: Vec<Element>,
     fs: Box<dyn DavFileSystem>,
@@ -201,19 +202,20 @@ impl DavInner {
 
         let mut pw = PropWriter::new(req, &mut res, name, props, &self.fs, self.ls.as_ref())?;
 
-        *res.body_mut() = Body::from(AsyncStream::new(|tx| async move {
-            pw.set_tx(tx);
+        let body_stream = try_stream! {
             let is_dir = meta.is_dir();
             pw.write_props(&path, meta).await?;
-            pw.flush().await?;
+            yield pw.flush();
 
             if is_dir && depth != davheaders::Depth::Zero {
-                let _ = self.propfind_directory(&path, depth, &mut pw).await;
+                for await item in self.propfind_directory(&path, depth, &mut pw) {
+                    yield item?;
+                }
             }
-            pw.close().await?;
-
-            Ok(())
-        }));
+            yield pw.close();
+        };
+        let _: &dyn Stream<Item = DavResult<Bytes>> = &body_stream;
+        *res.body_mut() = Body::from_stream(body_stream);
 
         Ok(res)
     }
@@ -223,22 +225,22 @@ impl DavInner {
         path: &'a DavPath,
         depth: davheaders::Depth,
         propwriter: &'a mut PropWriter,
-    ) -> BoxFuture<'a, DavResult<()>> {
-        async move {
+    ) -> BoxStream<DavResult<Bytes>> {
+        try_stream! {
             let readdir_meta = match self.hide_symlinks {
                 Some(true) | None => ReadDirMeta::DataSymlink,
                 Some(false) => ReadDirMeta::Data,
             };
-            let mut entries = match self.fs.read_dir(path, readdir_meta).await {
+            let entries = match self.fs.read_dir(path, readdir_meta).await {
                 Ok(entries) => entries,
                 Err(e) => {
                     // if we cannot read_dir, just skip it.
                     error!("read_dir error {:?}", e);
-                    return Ok(());
+                    return;
                 }
             };
 
-            while let Some(dirent) = entries.next().await {
+            for await dirent in entries {
                 let mut npath = path.clone();
                 npath.push_segment(&dirent.name());
                 let meta = match dirent.metadata().await {
@@ -256,12 +258,14 @@ impl DavInner {
                 }
                 let is_dir = meta.is_dir();
                 propwriter.write_props(&npath, meta).await?;
-                propwriter.flush().await?;
+                yield propwriter.flush();
                 if depth == davheaders::Depth::Infinity && is_dir {
-                    self.propfind_directory(&npath, depth, propwriter).await?;
+                    // TODO: see if we can chain the streams instead
+                    for await item in self.propfind_directory(&npath, depth, propwriter) {
+                        yield item?;
+                    }
                 }
             }
-            Ok(())
         }
         .boxed()
     }
@@ -427,7 +431,7 @@ impl DavInner {
         }
 
         // if any set/remove failed, stop processing here.
-        if ret.iter().any(|&(ref s, _)| s != &StatusCode::OK) {
+        if ret.iter().any(|(s, _)| s != &StatusCode::OK) {
             ret = ret
                 .into_iter()
                 .map(|(s, p)| {
@@ -462,12 +466,9 @@ impl DavInner {
 
         // And reply.
         let mut pw = PropWriter::new(req, &mut res, "propertyupdate", Vec::new(), &self.fs, None)?;
-        *res.body_mut() = Body::from(AsyncStream::new(|tx| async move {
-            pw.set_tx(tx);
-            pw.write_propresponse(&path, hm)?;
-            pw.close().await?;
-            Ok::<_, io::Error>(())
-        }));
+        pw.write_propresponse(&path, hm)?;
+        let body = pw.close();
+        *res.body_mut() = Body::from(body);
 
         Ok(res)
     }
@@ -553,7 +554,6 @@ impl PropWriter {
 
         Ok(PropWriter {
             emitter,
-            tx: None,
             name: name.to_string(),
             props,
             fs: fs.clone(),
@@ -561,10 +561,6 @@ impl PropWriter {
             useragent: ua.to_string(),
             q_cache: Default::default(),
         })
-    }
-
-    pub fn set_tx(&mut self, tx: Sender) {
-        self.tx = Some(tx)
     }
 
     fn build_elem<T>(
@@ -862,7 +858,7 @@ impl PropWriter {
             }
         }
 
-        Ok::<(), DavError>(self.write_propresponse(path, props)?)
+        self.write_propresponse(path, props)
     }
 
     pub fn write_propresponse(
@@ -897,20 +893,20 @@ impl PropWriter {
         Ok(())
     }
 
-    pub async fn flush(&mut self) -> DavResult<()> {
-        let buffer = self.emitter.inner_mut().take();
-        self.tx.as_mut().unwrap().send(buffer).await;
-        Ok(())
+    pub fn flush(&mut self) -> Bytes {
+        self.emitter.inner_mut().take()
     }
 
-    pub async fn close(&mut self) -> DavResult<()> {
-        let _ = self.emitter.write(XmlWEvent::end_element());
-        self.flush().await
+    pub fn close(&mut self) -> Bytes {
+        self.emitter
+            .write(XmlWEvent::end_element())
+            .expect("write end_element()");
+        self.flush()
     }
 }
 
 fn add_sc_elem(hm: &mut HashMap<StatusCode, Vec<Element>>, sc: StatusCode, e: Element) {
-    hm.entry(sc).or_insert_with(Vec::new);
+    hm.entry(sc).or_default();
     hm.get_mut(&sc).unwrap().push(e)
 }
 

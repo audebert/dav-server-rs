@@ -1,14 +1,16 @@
-use std::io;
 
+
+use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 
+use async_stream::try_stream;
 use http::{Response, StatusCode};
 use xml::common::XmlVersion;
 use xml::writer::EventWriter;
 use xml::writer::XmlEvent as XmlWEvent;
 use xml::EmitterConfig;
 
-use crate::async_stream::AsyncStream;
+
 use crate::body::Body;
 use crate::davpath::DavPath;
 use crate::util::MemBuffer;
@@ -102,8 +104,7 @@ where
     }
 
     // Transform path/status items to XML.
-    let body = AsyncStream::new(|mut tx| {
-        async move {
+    let body_stream = try_stream! {
             // Write initial header.
             let mut xw = EventWriter::new_with_config(
                 MemBuffer::new(),
@@ -120,10 +121,10 @@ where
             .map_err(DavError::from)?;
             xw.write(XmlWEvent::start_element("D:multistatus").ns("D", "DAV:"))
                 .map_err(DavError::from)?;
-            let data = xw.inner_mut().take();
-            tx.send(data).await;
+            yield xw.inner_mut().take();
 
             // now write the items.
+            // TODO: use `for await value in stream``
             let mut status_stream = futures_util::stream::iter(items).chain(status_stream);
             while let Some(res) = status_stream.next().await {
                 let (path, status) = res?;
@@ -134,23 +135,21 @@ where
                 };
                 write_response(&mut xw, &path, status)?;
                 let data = xw.inner_mut().take();
-                tx.send(data).await;
+                yield data;
             }
 
             // and finally write the trailer.
             xw.write(XmlWEvent::end_element()).map_err(DavError::from)?;
             let data = xw.inner_mut().take();
-            tx.send(data).await;
-
-            Ok::<_, io::Error>(())
-        }
-    });
+            yield data;
+    };
+    let _: &dyn Stream<Item = Result<Bytes, DavError>> = &body_stream;
 
     // return response.
     let resp = Response::builder()
         .header("content-type", "application/xml; charset=utf-8")
         .status(StatusCode::MULTI_STATUS)
-        .body(Body::from(body))
+        .body(Body::from_stream(body_stream))
         .unwrap();
     Ok(resp)
 }

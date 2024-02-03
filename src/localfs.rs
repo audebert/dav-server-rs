@@ -286,7 +286,7 @@ impl DavFileSystem for LocalFs {
             trace!("FS: read_dir {:?}", self.fspath_dbg(davpath));
             let path = self.fspath(davpath);
             let path2 = path.clone();
-            let iter = self.blocking(move || std::fs::read_dir(&path)).await;
+            let iter = self.blocking(move || std::fs::read_dir(path)).await;
             match iter {
                 Ok(iterator) => {
                     let strm = LocalFsReadDir {
@@ -602,7 +602,7 @@ impl LocalFsDirEntry {
             Meta::Fs(ref fs) => {
                 let fullpath = self.entry.path();
                 let ft = fs
-                    .blocking(move || std::fs::metadata(&fullpath))
+                    .blocking(move || std::fs::metadata(fullpath))
                     .await?
                     .file_type();
                 Ok(match is {
@@ -627,7 +627,7 @@ impl DavDirEntry for LocalFsDirEntry {
             }
             Meta::Fs(ref fs) => {
                 let fullpath = self.entry.path();
-                fs.blocking(move || match std::fs::metadata(&fullpath) {
+                fs.blocking(move || match std::fs::metadata(fullpath) {
                     Ok(meta) => Ok(Box::new(LocalFsMetaData(meta)) as Box<dyn DavMetaData>),
                     Err(e) => Err(e.into()),
                 })
